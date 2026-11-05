@@ -11,6 +11,8 @@ from typing import Optional
 
 import cv2
 import numpy as np
+import gspread
+from google.oauth2.service_account import Credentials
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
@@ -25,7 +27,6 @@ MATCH_THRESHOLD = 0.45
 MATCH_MARGIN = 0.05
 LOW_ATTENDANCE_PERCENT = 75
 
-# --- Admin login credentials (change these before deploying!) ---
 ADMIN_CREDENTIALS = {
     "admin": "admin123",
 }
@@ -38,8 +39,10 @@ EMB_DIR = DATA_DIR / "embeddings"
 PHOTO_DIR = DATA_DIR / "photos"
 REPORT_DIR = DATA_DIR / "reports"
 STUDENTS_CSV = DATA_DIR / "students.csv"
-ATTENDANCE_CSV = DATA_DIR / "attendance.csv"
+CREDENTIALS_FILE = BASE_DIR / "credentials.json"
+
 registration_lock = threading.Lock()
+sheet_lock = threading.Lock()
 
 STUDENT_FIELDS = ["roll_no", "name", "class", "registered_on"]
 ATT_FIELDS = ["date", "time", "roll_no", "name", "class", "status"]
@@ -56,15 +59,43 @@ MODEL_FILES = {
 }
 
 # ----------------------------------------------------------------------------
-# 2. STORAGE ENGINE
+# 2. GOOGLE SHEETS & STORAGE ENGINE
 # ----------------------------------------------------------------------------
+sheet = None
+
+def init_google_sheet():
+    global sheet
+    if CREDENTIALS_FILE.exists():
+        try:
+            scopes = [
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive"
+            ]
+            creds = Credentials.from_service_account_file(str(CREDENTIALS_FILE), scopes=scopes)
+            client = gspread.authorize(creds)
+            sheet = client.open("School_Attendance").sheet1
+            print("Successfully connected to Google Sheets!")
+        except Exception as e:
+            print(f"Warning: Could not connect to Google Sheets ({e}). Falling back to local CSV.")
+            sheet = None
+    else:
+        print("Warning: credentials.json not found! Falling back to local CSV.")
+        sheet = None
+
 def init_storage():
     for folder in (DATA_DIR, MODEL_DIR, EMB_DIR, PHOTO_DIR, REPORT_DIR, STATIC_DIR):
         folder.mkdir(parents=True, exist_ok=True)
-    for path, fields in ((STUDENTS_CSV, STUDENT_FIELDS), (ATTENDANCE_CSV, ATT_FIELDS)):
-        if not path.exists():
-            with open(path, "w", newline="", encoding="utf-8-sig") as f:
-                csv.writer(f).writerow(fields)
+    if not STUDENTS_CSV.exists():
+        with open(STUDENTS_CSV, "w", newline="", encoding="utf-8-sig") as f:
+            csv.writer(f).writerow(STUDENT_FIELDS)
+    init_google_sheet()
+
+def get_ist_now():
+    ist = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+    return datetime.datetime.now(ist)
+
+def today_str():
+    return get_ist_now().date().isoformat()
 
 def read_csv(path):
     if not path.exists():
@@ -78,9 +109,6 @@ def write_csv(path, fields, rows):
         writer.writeheader()
         writer.writerows(rows)
 
-def today_str():
-    return datetime.date.today().isoformat()
-
 def load_students():
     return read_csv(STUDENTS_CSV)
 
@@ -89,7 +117,8 @@ def add_student(roll, name, cls):
         raise ValueError(f"Roll number {roll} already exists.")
     with open(STUDENTS_CSV, "a", newline="", encoding="utf-8") as f:
         csv.DictWriter(f, fieldnames=STUDENT_FIELDS).writerow(
-            {"roll_no": roll, "name": name, "class": cls, "registered_on": today_str()})
+            {"roll_no": roll, "name": name, "class": cls, "registered_on": today_str()}
+        )
 
 def delete_student(roll):
     rows = [s for s in load_students() if s["roll_no"] != roll]
@@ -99,53 +128,106 @@ def delete_student(roll):
             path.unlink()
 
 def load_attendance(date=None):
-    rows = read_csv(ATTENDANCE_CSV)
-    return [r for r in rows if r["date"] == date] if date else rows
+    global sheet
+    if sheet:
+        with sheet_lock:
+            try:
+                records = sheet.get_all_records()
+                formatted = [
+                    {
+                        "date": str(r.get("date", "")),
+                        "time": str(r.get("time", "")),
+                        "roll_no": str(r.get("roll_no", "")),
+                        "name": str(r.get("name", "")),
+                        "class": str(r.get("class", "")),
+                        "status": str(r.get("status", ""))
+                    }
+                    for r in records
+                ]
+                return [r for r in formatted if r["date"] == date] if date else formatted
+            except Exception as e:
+                print(f"Error fetching from Google Sheet: {e}")
+                return []
+    return []
 
 def mark_attendance(student, status="Present"):
-    date, when = today_str(), datetime.datetime.now().strftime("%H:%M:%S")
-    rows = read_csv(ATTENDANCE_CSV)
-    for r in rows:
-        if r["date"] == date and r["roll_no"] == student["roll_no"]:
-            if r["status"] == "Absent" and status == "Present":
-                r["time"], r["status"] = when, "Present"
-                write_csv(ATTENDANCE_CSV, ATT_FIELDS, rows)
-                return "updated", when
-            return "exists", r["time"]
-    with open(ATTENDANCE_CSV, "a", newline="", encoding="utf-8") as f:
-        csv.DictWriter(f, fieldnames=ATT_FIELDS).writerow({
-            "date": date, "time": when, "roll_no": student["roll_no"],
-            "name": student["name"], "class": student["class"], "status": status})
-    return "new", when
+    global sheet
+    date = today_str()
+    when = get_ist_now().strftime("%H:%M:%S")
+
+    if not sheet:
+        return "error", when
+
+    with sheet_lock:
+        try:
+            records = sheet.get_all_records()
+            for idx, r in enumerate(records, start=2):
+                if str(r.get("date")) == date and str(r.get("roll_no")).strip() == str(student["roll_no"]).strip():
+                    if r.get("status") == "Absent" and status == "Present":
+                        sheet.update_cell(idx, 2, when)
+                        sheet.update_cell(idx, 6, "Present")
+                        return "updated", when
+                    return "exists", str(r.get("time", when))
+
+            sheet.append_row([
+                date,
+                when,
+                str(student["roll_no"]),
+                student["name"],
+                student["class"],
+                status
+            ])
+            return "new", when
+        except Exception as e:
+            print(f"Failed to append row in Google Sheet: {e}")
+            return "error", when
 
 def mark_absentees():
+    global sheet
+    if not sheet:
+        return 0
+
     date = today_str()
-    rows = read_csv(ATTENDANCE_CSV)
-    done = {r["roll_no"] for r in rows if r["date"] == date}
     added = 0
-    for s in load_students():
-        if s["roll_no"] not in done:
-            rows.append({"date": date, "time": "", "roll_no": s["roll_no"], "name": s["name"],
-                         "class": s["class"], "status": "Absent"})
-            added += 1
-    if added:
-        write_csv(ATTENDANCE_CSV, ATT_FIELDS, rows)
+    with sheet_lock:
+        try:
+            records = sheet.get_all_records()
+            done = {str(r.get("roll_no")).strip() for r in records if str(r.get("date")) == date}
+            for s in load_students():
+                if str(s["roll_no"]).strip() not in done:
+                    sheet.append_row([
+                        date,
+                        "",
+                        str(s["roll_no"]),
+                        s["name"],
+                        s["class"],
+                        "Absent"
+                    ])
+                    added += 1
+        except Exception as e:
+            print(f"Error marking absentees in Google Sheet: {e}")
     return added
 
 def make_summary_report():
-    rows = read_csv(ATTENDANCE_CSV)
-    total_days = len({r["date"] for r in rows})
+    rows = load_attendance()
+    total_days = len({r["date"] for r in rows if r["date"]})
     present = defaultdict(int)
     for r in rows:
         if r["status"] == "Present":
-            present[r["roll_no"]] += 1
+            present[str(r["roll_no"]).strip()] += 1
     out = []
     for s in load_students():
-        days = present[s["roll_no"]]
+        days = present[str(s["roll_no"]).strip()]
         percent = round(100 * days / total_days, 1) if total_days else 0.0
-        out.append({"roll_no": s["roll_no"], "name": s["name"], "class": s["class"],
-                    "days_present": days, "total_days": total_days, "percentage": percent,
-                    "remark": "Low attendance" if total_days and percent < LOW_ATTENDANCE_PERCENT else ""})
+        out.append({
+            "roll_no": s["roll_no"],
+            "name": s["name"],
+            "class": s["class"],
+            "days_present": days,
+            "total_days": total_days,
+            "percentage": percent,
+            "remark": "Low attendance" if total_days and percent < LOW_ATTENDANCE_PERCENT else ""
+        })
     path = REPORT_DIR / f"attendance_summary_{today_str()}.csv"
     write_csv(path, ["roll_no", "name", "class", "days_present", "total_days", "percentage", "remark"], out)
     return path
